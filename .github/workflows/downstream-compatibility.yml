@@ -3,8 +3,10 @@ name: Test Downstream Compatibility
 on:
   pull_request:
   push:
+    branches: 
+      - '*'
     tags:
-      - 'v*'
+      - '*'
   release:
     types: [published, created]
 
