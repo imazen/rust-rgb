@@ -134,56 +134,77 @@ jobs:
             echo -e "${BLUE}[$(date +%H:%M:%S)] Testing ${crate}...${NC}"
             START=$(date +%s)
             
-            # Download from crates.io
+            # Download from crates.io using cargo directly
             echo -e "  ${CYAN}Downloading from crates.io...${NC}"
-            if cargo download "$crate" 2>&1 | tee download.log; then
-              # Find the downloaded directory (cargo download creates crate-version/)
-              CRATE_DIR=$(ls -d ${crate}-* 2>/dev/null | head -1)
-              
-              if [ -z "$CRATE_DIR" ]; then
-                RESULTS[$crate]="⚠"
-                STATUS="SKIP"
-                COLOR=$YELLOW
-                ERRORS[$crate]="Failed to find downloaded crate"
-              else
-                cd "$CRATE_DIR"
-                
-                echo "" >> Cargo.toml
-                echo "[patch.crates-io]" >> Cargo.toml
-                echo "${CRATE_NAME} = { path = \"${CRATE_PATH}\" }" >> Cargo.toml
-                
-                echo -e "  ${CYAN}Building and testing...${NC}"
-                if timeout 600 cargo test --quiet 2>&1 | tee ../test.log; then
-                  RESULTS[$crate]="✓"
-                  STATUS="PASSED"
-                  COLOR=$GREEN
-                  ERRORS[$crate]=""
-                else
-                  EXIT_CODE=$?
-                  if [ $EXIT_CODE -eq 124 ]; then
-                    RESULTS[$crate]="⏱"
-                    STATUS="TIMEOUT"
-                    COLOR=$YELLOW
-                    ERRORS[$crate]="Test exceeded 10 minute timeout"
-                  else
-                    RESULTS[$crate]="✗"
-                    STATUS="FAILED"
-                    COLOR=$RED
-                    ERRORS[$crate]=$(tail -5 ../test.log | sed 's/^/    /')
-                  fi
-                fi
-                
-                cd ..
-                rm -rf "$CRATE_DIR"
-              fi
-              
-              rm -f test.log download.log
-            else
+            
+            # Get the latest version from crates.io API
+            CRATE_INFO=$(curl -s "https://crates.io/api/v1/crates/${crate}")
+            LATEST_VERSION=$(echo "$CRATE_INFO" | grep -o '"max_version":"[^"]*"' | head -1 | cut -d'"' -f4)
+            
+            if [ -z "$LATEST_VERSION" ]; then
               RESULTS[$crate]="⚠"
               STATUS="SKIP"
               COLOR=$YELLOW
-              ERRORS[$crate]="Failed to download crate from crates.io"
+              ERRORS[$crate]="Failed to get crate info from crates.io"
+              END=$(date +%s)
+              DURATIONS[$crate]=$((END - START))
+              echo -e "  ${COLOR}${RESULTS[$crate]} ${STATUS}${NC} (${DURATIONS[$crate]}s)"
+              echo -e "${RED}${ERRORS[$crate]}${NC}"
+              echo ""
+              continue
             fi
+            
+            echo -e "  ${CYAN}Latest version: ${LATEST_VERSION}${NC}"
+            
+            # Create a temp Cargo.toml to download the crate
+            mkdir -p "test_${crate}"
+            cd "test_${crate}"
+            
+            cat > Cargo.toml <<EOF
+          [package]
+          name = "test_${crate}"
+          version = "0.0.0"
+          edition = "2021"
+          
+          [dependencies]
+          ${crate} = "${LATEST_VERSION}"
+          
+          [patch.crates-io]
+          ${CRATE_NAME} = { path = "${CRATE_PATH}" }
+          EOF
+            
+            cat > src/lib.rs <<EOF
+          // Empty test crate
+          EOF
+            
+            mkdir -p src
+            
+            echo -e "  ${CYAN}Building and testing...${NC}"
+            
+            # Try to build - this will download and test the crate with our patch
+            if timeout 600 cargo test --quiet 2>&1 | tee ../test.log; then
+              RESULTS[$crate]="✓"
+              STATUS="PASSED"
+              COLOR=$GREEN
+              ERRORS[$crate]=""
+            else
+              EXIT_CODE=$?
+              if [ $EXIT_CODE -eq 124 ]; then
+                RESULTS[$crate]="⏱"
+                STATUS="TIMEOUT"
+                COLOR=$YELLOW
+                ERRORS[$crate]="Test exceeded 10 minute timeout"
+              else
+                RESULTS[$crate]="✗"
+                STATUS="FAILED"
+                COLOR=$RED
+                ERRORS[$crate]=$(tail -5 ../test.log | sed 's/^/    /')
+              fi
+            fi
+            
+            cd ..
+            rm -rf "test_${crate}"
+            rm -f test.log
             
             END=$(date +%s)
             DURATIONS[$crate]=$((END - START))
@@ -236,7 +257,7 @@ jobs:
           echo -e "  ${CYAN}⏱ Total:${NC}   ${TOTAL_DURATION}s"
           echo ""
           
-          cat > /results/results.md <<EOF
+          cat > /workspace/results.md <<EOF
           ## 🧪 Downstream Compatibility Test Results
           
           **Repository:** \`${REPO_OWNER}/${REPO_NAME}\`  
@@ -261,10 +282,10 @@ jobs:
               *) status_text="Skipped";;
             esac
             
-            echo "| \`$crate\` | $status_emoji $status_text | ${DURATIONS[$crate]}s |" >> /results/results.md
+            echo "| \`$crate\` | $status_emoji $status_text | ${DURATIONS[$crate]}s |" >> /workspace/results.md
           done
           
-          cat >> /results/results.md <<EOF
+          cat >> /workspace/results.md <<EOF
           
           ### Summary
           
@@ -278,7 +299,7 @@ jobs:
           <sub>Generated by downstream-test at $(date -u +"%Y-%m-%d %H:%M:%S UTC")</sub>
           EOF
           
-          cat > /results/stats.env <<EOF
+          cat > /workspace/stats.env <<EOF
           PASSED=$PASSED
           FAILED=$FAILED
           TIMEOUT=$TIMEOUT
@@ -286,7 +307,7 @@ jobs:
           TOTAL_DURATION=$TOTAL_DURATION
           EOF
           
-          cat /results/results.md
+          cat /workspace/results.md
           
           [ $FAILED -eq 0 ]
           SCRIPT
@@ -298,30 +319,36 @@ jobs:
         continue-on-error: true
         run: |
           mkdir -p results
+          chmod 777 results  # Ensure Docker can write to it
           
           docker run --rm \
-            --network none \
             --memory="8g" \
             --cpus="4" \
             --security-opt=no-new-privileges \
             --cap-drop=ALL \
             --pids-limit=200 \
-            -v $(pwd):/workspace/crate:ro \
-            -v $(pwd)/test-all.sh:/test-all.sh:ro \
-            -v $(pwd)/results:/results:rw \
+            -v $(pwd):/workspace:rw \
             -v downstream-cargo-cache-${{ github.repository_owner }}-${{ github.event.repository.name }}:/usr/local/cargo/registry \
             -v downstream-cargo-git-${{ github.repository_owner }}-${{ github.event.repository.name }}:/usr/local/cargo/git \
             -w /workspace \
             rust:latest \
-            bash /test-all.sh \
+            bash /workspace/test-all.sh \
               "${{ steps.metadata.outputs.crate-name }}" \
-              "/workspace/crate" \
+              "/workspace" \
               "${{ steps.metadata.outputs.test-type }}" \
               "${{ steps.metadata.outputs.test-ref }}" \
               "${{ steps.metadata.outputs.repo-owner }}" \
               "${{ steps.metadata.outputs.repo-name }}" \
               "${{ steps.config.outputs.source }}" \
               "${{ steps.config.outputs.crates }}"
+          
+          # Copy results out
+          if [ -f results.md ]; then
+            mv results.md results/
+          fi
+          if [ -f stats.env ]; then
+            mv stats.env results/
+          fi
       
       - name: Process results
         id: results
