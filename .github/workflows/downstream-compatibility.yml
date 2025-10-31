@@ -3,12 +3,16 @@ name: Test Downstream Compatibility
 on:
   pull_request:
   push:
-    branches: 
-      - '*'
+    branches:
+      - '**'
     tags:
-      - '*'
+      - '**'
   release:
     types: [published, created]
+
+# Configure your downstream crates here (comma-separated)
+env:
+  DOWNSTREAM_CRATES: "load_image,cavif,dssim,usc,okhsl,kapy,fecund_font_flounder,feather-ui,unitedservices_common"
 
 jobs:
   test-dependents:
@@ -24,17 +28,13 @@ jobs:
       - name: Extract crate metadata
         id: metadata
         run: |
-          # Get crate name from Cargo.toml
           CRATE_NAME=$(grep -m1 '^name = ' Cargo.toml | sed 's/name = "\(.*\)"/\1/')
           echo "crate-name=$CRATE_NAME" >> $GITHUB_OUTPUT
-          
-          # Get repository info from context
           echo "repo-name=${{ github.event.repository.name }}" >> $GITHUB_OUTPUT
           echo "repo-owner=${{ github.repository_owner }}" >> $GITHUB_OUTPUT
           echo "ref-name=${{ github.ref_name }}" >> $GITHUB_OUTPUT
           echo "event-name=${{ github.event_name }}" >> $GITHUB_OUTPUT
           
-          # Determine what we're testing
           if [[ "${{ github.event_name }}" == "pull_request" ]]; then
             TEST_TYPE="Pull Request #${{ github.event.pull_request.number }}"
             TEST_REF="${{ github.event.pull_request.head.sha }}"
@@ -54,18 +54,20 @@ jobs:
           
           echo "Testing crate: $CRATE_NAME"
           echo "Test type: $TEST_TYPE"
-          echo "Test ref: $TEST_REF"
       
       - name: Configure downstream crates
         id: config
         run: |
-          # TODO: Replace this with your actual downstream dependents
-          # You could also read this from a .github/downstream-crates.txt file
-          CRATES="load_image,cavif,dssim,usc,okhsl,kapy,fecund_font_flounder,feather-ui,unitedservices_common"
-          
-          # Or read from a file if it exists
-          if [ -f .github/downstream-crates.txt ]; then
+          # Use environment variable or fall back to file
+          if [ -n "${{ env.DOWNSTREAM_CRATES }}" ]; then
+            CRATES="${{ env.DOWNSTREAM_CRATES }}"
+            echo "source=configured" >> $GITHUB_OUTPUT
+          elif [ -f .github/downstream-crates.txt ]; then
             CRATES=$(cat .github/downstream-crates.txt | tr '\n' ',' | sed 's/,$//')
+            echo "source=file" >> $GITHUB_OUTPUT
+          else
+            CRATES=""
+            echo "source=none" >> $GITHUB_OUTPUT
           fi
           
           echo "crates=$CRATES" >> $GITHUB_OUTPUT
@@ -91,8 +93,22 @@ jobs:
           TEST_REF=$4
           REPO_OWNER=$5
           REPO_NAME=$6
+          SOURCE=$7
           
-          IFS=',' read -ra CRATES <<< "$7"
+          IFS=',' read -ra CRATES <<< "$8"
+          
+          # Filter out empty entries
+          FILTERED_CRATES=()
+          for crate in "${CRATES[@]}"; do
+            crate=$(echo "$crate" | xargs)
+            [ -n "$crate" ] && FILTERED_CRATES+=("$crate")
+          done
+          CRATES=("${FILTERED_CRATES[@]}")
+          
+          if [ ${#CRATES[@]} -eq 0 ]; then
+            echo -e "${YELLOW}No downstream dependents to test${NC}"
+            exit 0
+          fi
           
           declare -A RESULTS
           declare -A DURATIONS
@@ -106,6 +122,7 @@ jobs:
           echo -e "${MAGENTA}Crate:${NC} ${CRATE_NAME}"
           echo -e "${MAGENTA}Testing:${NC} ${TEST_TYPE}"
           echo -e "${MAGENTA}Ref:${NC} ${TEST_REF}"
+          echo -e "${MAGENTA}Dependents source:${NC} ${SOURCE}"
           echo -e "${MAGENTA}Downstream crates:${NC} ${#CRATES[@]}"
           echo ""
           echo -e "${BLUE}────────────────────────────────────────────────────────────${NC}"
@@ -114,58 +131,64 @@ jobs:
           TOTAL_START=$(date +%s)
           
           for crate in "${CRATES[@]}"; do
-            crate=$(echo "$crate" | xargs)  # Trim whitespace
-            [ -z "$crate" ] && continue
-            
             echo -e "${BLUE}[$(date +%H:%M:%S)] Testing ${crate}...${NC}"
             START=$(date +%s)
             
-            # Clone the crate
-            if cargo clone "$crate" 2>&1 | tee clone.log | grep -q "Downloaded"; then
-              cd "$crate"
+            # Download from crates.io
+            echo -e "  ${CYAN}Downloading from crates.io...${NC}"
+            if cargo download "$crate" 2>&1 | tee download.log; then
+              # Find the downloaded directory (cargo download creates crate-version/)
+              CRATE_DIR=$(ls -d ${crate}-* 2>/dev/null | head -1)
               
-              # Add patch section to use our local version
-              echo "" >> Cargo.toml
-              echo "[patch.crates-io]" >> Cargo.toml
-              echo "${CRATE_NAME} = { path = \"${CRATE_PATH}\" }" >> Cargo.toml
-              
-              # Try to build and test with timeout
-              echo -e "  ${CYAN}Building...${NC}"
-              if timeout 600 cargo test --quiet 2>&1 | tee ../test.log; then
-                RESULTS[$crate]="✓"
-                STATUS="PASSED"
-                COLOR=$GREEN
-                ERRORS[$crate]=""
+              if [ -z "$CRATE_DIR" ]; then
+                RESULTS[$crate]="⚠"
+                STATUS="SKIP"
+                COLOR=$YELLOW
+                ERRORS[$crate]="Failed to find downloaded crate"
               else
-                EXIT_CODE=$?
-                if [ $EXIT_CODE -eq 124 ]; then
-                  RESULTS[$crate]="⏱"
-                  STATUS="TIMEOUT"
-                  COLOR=$YELLOW
-                  ERRORS[$crate]="Test exceeded 10 minute timeout"
+                cd "$CRATE_DIR"
+                
+                echo "" >> Cargo.toml
+                echo "[patch.crates-io]" >> Cargo.toml
+                echo "${CRATE_NAME} = { path = \"${CRATE_PATH}\" }" >> Cargo.toml
+                
+                echo -e "  ${CYAN}Building and testing...${NC}"
+                if timeout 600 cargo test --quiet 2>&1 | tee ../test.log; then
+                  RESULTS[$crate]="✓"
+                  STATUS="PASSED"
+                  COLOR=$GREEN
+                  ERRORS[$crate]=""
                 else
-                  RESULTS[$crate]="✗"
-                  STATUS="FAILED"
-                  COLOR=$RED
-                  # Capture last few lines of error
-                  ERRORS[$crate]=$(tail -5 ../test.log | sed 's/^/    /')
+                  EXIT_CODE=$?
+                  if [ $EXIT_CODE -eq 124 ]; then
+                    RESULTS[$crate]="⏱"
+                    STATUS="TIMEOUT"
+                    COLOR=$YELLOW
+                    ERRORS[$crate]="Test exceeded 10 minute timeout"
+                  else
+                    RESULTS[$crate]="✗"
+                    STATUS="FAILED"
+                    COLOR=$RED
+                    ERRORS[$crate]=$(tail -5 ../test.log | sed 's/^/    /')
+                  fi
                 fi
+                
+                cd ..
+                rm -rf "$CRATE_DIR"
               fi
               
-              cd ..
-              rm -f test.log clone.log
+              rm -f test.log download.log
             else
               RESULTS[$crate]="⚠"
               STATUS="SKIP"
               COLOR=$YELLOW
-              ERRORS[$crate]="Failed to clone crate"
+              ERRORS[$crate]="Failed to download crate from crates.io"
             fi
             
             END=$(date +%s)
             DURATIONS[$crate]=$((END - START))
             echo -e "  ${COLOR}${RESULTS[$crate]} ${STATUS}${NC} (${DURATIONS[$crate]}s)"
             
-            # Show error if present and not too long
             if [ -n "${ERRORS[$crate]}" ] && [ "${#ERRORS[$crate]}" -lt 500 ]; then
               echo -e "${RED}${ERRORS[$crate]}${NC}"
             fi
@@ -175,7 +198,6 @@ jobs:
           TOTAL_END=$(date +%s)
           TOTAL_DURATION=$((TOTAL_END - TOTAL_START))
           
-          # Summary
           echo -e "${BLUE}────────────────────────────────────────────────────────────${NC}"
           echo -e "${CYAN}╔════════════════════════════════════════════════════════════╗${NC}"
           echo -e "${CYAN}║${NC}  ${BLUE}SUMMARY${NC}                                                ${CYAN}║${NC}"
@@ -185,9 +207,6 @@ jobs:
           PASSED=0; FAILED=0; TIMEOUT=0; SKIP=0
           
           for crate in "${CRATES[@]}"; do
-            crate=$(echo "$crate" | xargs)
-            [ -z "$crate" ] && continue
-            
             case "${RESULTS[$crate]}" in
               "✓") 
                 echo -e "${GREEN}✓${NC} $crate ${CYAN}(${DURATIONS[$crate]}s)${NC}"
@@ -217,14 +236,14 @@ jobs:
           echo -e "  ${CYAN}⏱ Total:${NC}   ${TOTAL_DURATION}s"
           echo ""
           
-          # Generate markdown summary for GitHub
-          cat > /tmp/results.md <<EOF
+          cat > /results/results.md <<EOF
           ## 🧪 Downstream Compatibility Test Results
           
           **Repository:** \`${REPO_OWNER}/${REPO_NAME}\`  
           **Crate:** \`${CRATE_NAME}\`  
           **Testing:** ${TEST_TYPE}  
-          **Ref:** \`${TEST_REF}\`
+          **Ref:** \`${TEST_REF}\`  
+          **Dependents source:** ${SOURCE}
           
           ### Results
           
@@ -233,9 +252,6 @@ jobs:
           EOF
           
           for crate in "${CRATES[@]}"; do
-            crate=$(echo "$crate" | xargs)
-            [ -z "$crate" ] && continue
-            
             status_emoji="${RESULTS[$crate]}"
             status_text=""
             case "$status_emoji" in
@@ -245,10 +261,10 @@ jobs:
               *) status_text="Skipped";;
             esac
             
-            echo "| \`$crate\` | $status_emoji $status_text | ${DURATIONS[$crate]}s |" >> /tmp/results.md
+            echo "| \`$crate\` | $status_emoji $status_text | ${DURATIONS[$crate]}s |" >> /results/results.md
           done
           
-          cat >> /tmp/results.md <<EOF
+          cat >> /results/results.md <<EOF
           
           ### Summary
           
@@ -262,8 +278,7 @@ jobs:
           <sub>Generated by downstream-test at $(date -u +"%Y-%m-%d %H:%M:%S UTC")</sub>
           EOF
           
-          # Save stats for GitHub Actions
-          cat > /tmp/stats.env <<EOF
+          cat > /results/stats.env <<EOF
           PASSED=$PASSED
           FAILED=$FAILED
           TIMEOUT=$TIMEOUT
@@ -271,9 +286,8 @@ jobs:
           TOTAL_DURATION=$TOTAL_DURATION
           EOF
           
-          cat /tmp/results.md
+          cat /results/results.md
           
-          # Exit with failure if any tests failed
           [ $FAILED -eq 0 ]
           SCRIPT
           
@@ -294,7 +308,7 @@ jobs:
             --pids-limit=200 \
             -v $(pwd):/workspace/crate:ro \
             -v $(pwd)/test-all.sh:/test-all.sh:ro \
-            -v $(pwd)/results:/tmp:rw \
+            -v $(pwd)/results:/results:rw \
             -v downstream-cargo-cache-${{ github.repository_owner }}-${{ github.event.repository.name }}:/usr/local/cargo/registry \
             -v downstream-cargo-git-${{ github.repository_owner }}-${{ github.event.repository.name }}:/usr/local/cargo/git \
             -w /workspace \
@@ -306,6 +320,7 @@ jobs:
               "${{ steps.metadata.outputs.test-ref }}" \
               "${{ steps.metadata.outputs.repo-owner }}" \
               "${{ steps.metadata.outputs.repo-name }}" \
+              "${{ steps.config.outputs.source }}" \
               "${{ steps.config.outputs.crates }}"
       
       - name: Process results
@@ -315,14 +330,12 @@ jobs:
           if [ -f results/results.md ]; then
             cat results/results.md
             
-            # Set multiline output
             {
               echo "markdown<<EOF"
               cat results/results.md
               echo "EOF"
             } >> $GITHUB_OUTPUT
             
-            # Load stats
             if [ -f results/stats.env ]; then
               source results/stats.env
               echo "passed=$PASSED" >> $GITHUB_OUTPUT
@@ -331,7 +344,6 @@ jobs:
               echo "skip=$SKIP" >> $GITHUB_OUTPUT
               echo "duration=$TOTAL_DURATION" >> $GITHUB_OUTPUT
               
-              # Create a summary for the step
               echo "### Test Summary" >> $GITHUB_STEP_SUMMARY
               echo "- ✓ Passed: $PASSED" >> $GITHUB_STEP_SUMMARY
               echo "- ✗ Failed: $FAILED" >> $GITHUB_STEP_SUMMARY
@@ -354,7 +366,6 @@ jobs:
           script: |
             const markdown = `${{ steps.results.outputs.markdown }}`;
             
-            // Try to find existing comment
             const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -367,7 +378,6 @@ jobs:
             );
             
             if (botComment) {
-              // Update existing comment
               await github.rest.issues.updateComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
@@ -375,7 +385,6 @@ jobs:
                 body: markdown
               });
             } else {
-              // Create new comment
               await github.rest.issues.createComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
@@ -395,7 +404,6 @@ jobs:
             const markdown = `${{ steps.results.outputs.markdown }}`;
             const release = context.payload.release;
             
-            // Append to release body
             const newBody = (release.body || '') + '\n\n' + markdown;
             
             await github.rest.repos.updateRelease({
